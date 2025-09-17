@@ -1,7 +1,17 @@
 (function () {
+  // --- Identify the script tag that loaded rum.js ---
+  const currentScript = document.currentScript ||
+    document.querySelector('script[data-endpoint-id]');
+
+  // Extract endpointId if provided
+  const endpointId = currentScript ? currentScript.getAttribute("data-endpoint-id") : null;
+
+  // Generate or reuse sessionId
   const sessionId = sessionStorage.getItem("rum_session_id") ||
     "sess-" + Date.now() + "-" + Math.random().toString(16).slice(2);
   sessionStorage.setItem("rum_session_id", sessionId);
+
+  const rumIds = { session_id: sessionId, endpoint_id: endpointId };
 
   // ---------------- Page Load Observers ----------------
   let fpValue = null, fcpValue = null, lcpValue = null;
@@ -84,18 +94,19 @@
       screen_height: window.screen.height || 0,
       pixel_ratio: window.devicePixelRatio || 1,
       connection: navigator.connection ? {
-        effectiveType: navigator.connection.effectiveType,
+        connection_quality: navigator.connection.effectiveType,
         downlink: navigator.connection.downlink,
         rtt: navigator.connection.rtt
       } : "not_supported"
     };
   }
 
-  // ---------------- Collect All Metrics ----------------
+  // ---------------- Collect Core Metrics ----------------
   function collectRUMMetrics(trigger = "page_load") {
     const perf = performance.getEntriesByType("navigation")[0] || {};
     return {
-      session_id: sessionId,
+      session_id: rumIds.session_id,
+      endpoint_id: rumIds.endpoint_id,
       url: window.location.href,
       timestamp: new Date().toISOString(),
       trigger,
@@ -120,14 +131,20 @@
 
   // ---------------- Send Metrics ----------------
   function sendMetrics(data) {
+    const payload = {
+      ...data,
+      session_id: rumIds.session_id,
+      endpoint_id: rumIds.endpoint_id
+    };
+
     if (navigator.sendBeacon) {
-      const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+      const blob = new Blob([JSON.stringify(payload)], { type: "application/json" });
       navigator.sendBeacon("http://localhost:8000/rum/page-metrics", blob);
     } else {
       fetch("http://localhost:8000/rum/page-metrics", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(data)
+        body: JSON.stringify(payload)
       }).catch(console.error);
     }
   }
@@ -135,7 +152,8 @@
   // ---------------- JavaScript Error Metrics ----------------
   window.addEventListener("error", function (event) {
     sendMetrics({
-      session_id: sessionId,
+      session_id: rumIds.session_id,
+      endpoint_id: rumIds.endpoint_id,
       url: window.location.href,
       timestamp: new Date().toISOString(),
       trigger: "js_error",
@@ -151,7 +169,8 @@
 
   window.addEventListener("unhandledrejection", function (event) {
     sendMetrics({
-      session_id: sessionId,
+      session_id: rumIds.session_id,
+      endpoint_id: rumIds.endpoint_id,
       url: window.location.href,
       timestamp: new Date().toISOString(),
       trigger: "js_promise_rejection",
@@ -169,7 +188,8 @@
       this.addEventListener("loadend", function() {
         const duration = performance.now() - this._reqData.start;
         sendMetrics({
-          session_id: sessionId,
+          session_id: rumIds.session_id,
+          endpoint_id: rumIds.endpoint_id,
           url: window.location.href,
           timestamp: new Date().toISOString(),
           trigger: "api_call",
@@ -195,7 +215,8 @@
       return fetchFn.apply(this, arguments).then(response => {
         const duration = performance.now() - start;
         sendMetrics({
-          session_id: sessionId,
+          session_id: rumIds.session_id,
+          endpoint_id: rumIds.endpoint_id,
           url: window.location.href,
           timestamp: new Date().toISOString(),
           trigger: "api_call",
@@ -211,7 +232,8 @@
       }).catch(err => {
         const duration = performance.now() - start;
         sendMetrics({
-          session_id: sessionId,
+          session_id: rumIds.session_id,
+          endpoint_id: rumIds.endpoint_id,
           url: window.location.href,
           timestamp: new Date().toISOString(),
           trigger: "api_call_error",
@@ -232,7 +254,8 @@
   // ---------------- Business Metrics (Custom) ----------------
   function logBusinessMetric(name, value, extra = {}) {
     sendMetrics({
-      session_id: sessionId,
+      session_id: rumIds.session_id,
+      endpoint_id: rumIds.endpoint_id,
       url: window.location.href,
       timestamp: new Date().toISOString(),
       trigger: "business_metric",
@@ -256,7 +279,8 @@
   // ---------------- Environment Metrics ----------------
   window.addEventListener("load", () => {
     sendMetrics({
-      session_id: sessionId,
+      session_id: rumIds.session_id,
+      endpoint_id: rumIds.endpoint_id,
       url: window.location.href,
       timestamp: new Date().toISOString(),
       trigger: "environment",
@@ -285,27 +309,19 @@
     setTimeout(() => sendMetrics(collectRUMMetrics("spa_navigation")), 300);
   });
 
-  // Simple SPA simulator for demo
-  window.navigate = function(path) {
-    history.pushState({}, "", path);
-    document.getElementById("content").innerHTML = "<p>You are now on " + path + " page.</p>";
-  };
-
-  // Adding heartbeat logic
+  // ---------------- Heartbeat (real-time users) ----------------
   function sendHeartbeat() {
-  sendMetrics({
-    session_id: sessionId,
-    url: window.location.href,
-    timestamp: new Date().toISOString(),
-    trigger: "heartbeat",
-    environment: collectEnvironmentMetrics()
-  });
-}
+    sendMetrics({
+      session_id: rumIds.session_id,
+      endpoint_id: rumIds.endpoint_id,
+      url: window.location.href,
+      timestamp: new Date().toISOString(),
+      trigger: "heartbeat",
+      environment: collectEnvironmentMetrics()
+    });
+  }
 
-// Send heartbeat every 15s
-setInterval(sendHeartbeat, 15000);
-
-// Send one immediately on page load
-window.addEventListener("load", sendHeartbeat);
+  setInterval(sendHeartbeat, 15000); // every 15s
+  window.addEventListener("load", sendHeartbeat);
 
 })();
