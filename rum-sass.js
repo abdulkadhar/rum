@@ -1,17 +1,46 @@
 (function () {
-  // --- Identify the script tag that loaded rum.js ---
   const currentScript = document.currentScript ||
     document.querySelector('script[data-endpoint-id]');
 
-  // Extract endpointId if provided
+  // Config from <script> tag
   const endpointId = currentScript ? currentScript.getAttribute("data-endpoint-id") : null;
+  const apiBaseUrl = currentScript ? currentScript.getAttribute("data-api-url") || "http://localhost:8000" : "http://localhost:8000";
+  const errorsBaseUrl = currentScript ? currentScript.getAttribute("data-errors-url") || apiBaseUrl : apiBaseUrl;
 
-  // Generate or reuse sessionId
+  // Session ID
   const sessionId = sessionStorage.getItem("rum_session_id") ||
     "sess-" + Date.now() + "-" + Math.random().toString(16).slice(2);
   sessionStorage.setItem("rum_session_id", sessionId);
 
   const rumIds = { session_id: sessionId, endpoint_id: endpointId };
+
+  // ---------------- Helpers ----------------
+  function sendMetrics(data) {
+    const payload = { ...data, ...rumIds };
+    const url = `${apiBaseUrl}/rum/page-metrics`;
+
+    if (navigator.sendBeacon) {
+      const blob = new Blob([JSON.stringify(payload)], { type: "application/json" });
+      navigator.sendBeacon(url, blob);
+    } else {
+      fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      }).catch(console.error);
+    }
+  }
+
+  function sendError(data) {
+    const payload = { ...data, ...rumIds };
+    const url = `${errorsBaseUrl}/rum/errors`;
+
+    fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    }).catch(console.error);
+  }
 
   // ---------------- Page Load Observers ----------------
   let fpValue = null, fcpValue = null, lcpValue = null;
@@ -71,7 +100,7 @@
   function collectResourceMetrics() {
     const resources = performance.getEntriesByType("resource") || [];
     return resources
-      .filter(r => r.initiatorType !== "beacon") // 🚫 ignore beacon calls
+      .filter(r => r.initiatorType !== "beacon")
       .map(r => ({
         name: r.name,
         type: r.initiatorType,
@@ -94,7 +123,7 @@
       screen_height: window.screen.height || 0,
       pixel_ratio: window.devicePixelRatio || 1,
       connection: navigator.connection ? {
-        connection_quality: navigator.connection.effectiveType,
+        effectiveType: navigator.connection.effectiveType,
         downlink: navigator.connection.downlink,
         rtt: navigator.connection.rtt
       } : "not_supported"
@@ -105,57 +134,27 @@
   function collectRUMMetrics(trigger = "page_load") {
     const perf = performance.getEntriesByType("navigation")[0] || {};
     return {
-      session_id: rumIds.session_id,
-      endpoint_id: rumIds.endpoint_id,
       url: window.location.href,
       timestamp: new Date().toISOString(),
       trigger,
       metrics: {
-        // Page Load
         ttfb: perf.responseStart - perf.requestStart || null,
         dom_content_loaded: perf.domContentLoadedEventEnd || null,
         first_paint: fpValue,
         first_contentful_paint: fcpValue,
         largest_contentful_paint: lcpValue,
         onload: perf.loadEventEnd || null,
-        // User Interaction
         first_input_delay: fidValue,
         interaction_to_next_paint: inpValue,
-        // Stability
         cumulative_layout_shift: clsValue,
-        // Resources
         resources: collectResourceMetrics()
       }
     };
   }
 
-  // ---------------- Send Metrics ----------------
-  function sendMetrics(data) {
-    const payload = {
-      ...data,
-      session_id: rumIds.session_id,
-      endpoint_id: rumIds.endpoint_id
-    };
-
-    if (navigator.sendBeacon) {
-      const blob = new Blob([JSON.stringify(payload)], { type: "application/json" });
-      navigator.sendBeacon("http://localhost:8000/rum/page-metrics", blob);
-    } else {
-      fetch("http://localhost:8000/rum/page-metrics", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      }).catch(console.error);
-    }
-  }
-
-  // ---------------- JavaScript Error Metrics ----------------
+  // ---------------- Error Capture ----------------
   window.addEventListener("error", function (event) {
-    sendMetrics({
-      session_id: rumIds.session_id,
-      endpoint_id: rumIds.endpoint_id,
-      url: window.location.href,
-      timestamp: new Date().toISOString(),
+    sendError({
       trigger: "js_error",
       error: {
         message: event.message,
@@ -168,11 +167,7 @@
   });
 
   window.addEventListener("unhandledrejection", function (event) {
-    sendMetrics({
-      session_id: rumIds.session_id,
-      endpoint_id: rumIds.endpoint_id,
-      url: window.location.href,
-      timestamp: new Date().toISOString(),
+    sendError({
       trigger: "js_promise_rejection",
       error: {
         message: event.reason ? event.reason.message || event.reason : "Unhandled Promise Rejection",
@@ -181,18 +176,63 @@
     });
   });
 
-  // ---------------- Network / API Call Metrics ----------------
+  // ---------------- Patch Fetch ----------------
+  (function(fetchFn) {
+    window.fetch = function(input, init = {}) {
+      init = init || {};
+      init.headers = {
+        ...(init.headers || {}),
+        "X-RUM-Session-Id": rumIds.session_id,
+        "X-RUM-Endpoint-Id": rumIds.endpoint_id
+      };
+
+      const start = performance.now();
+      const method = init.method || "GET";
+
+      return fetchFn.call(this, input, init).then(response => {
+        const duration = performance.now() - start;
+        if (response.status >= 400) {
+          sendError({
+            trigger: "api_call_error",
+            api: { type: "fetch", method, endpoint: typeof input === "string" ? input : input.url, status: response.status, duration }
+          });
+        } else {
+          sendMetrics({
+            trigger: "api_call",
+            api: { type: "fetch", method, endpoint: typeof input === "string" ? input : input.url, status: response.status, duration }
+          });
+        }
+        return response;
+      }).catch(err => {
+        const duration = performance.now() - start;
+        sendError({
+          trigger: "api_call_exception",
+          api: { type: "fetch", method, endpoint: typeof input === "string" ? input : input.url, status: null, duration, error: err.message }
+        });
+        throw err;
+      });
+    };
+  })(window.fetch);
+
+  // ---------------- Patch XHR ----------------
   (function(open) {
     XMLHttpRequest.prototype.open = function(method, url, async, user, password) {
       this._reqData = { method, url, start: performance.now() };
+
+      this.addEventListener("readystatechange", function() {
+        if (this.readyState === 1) {
+          try {
+            this.setRequestHeader("X-RUM-Session-Id", rumIds.session_id);
+            this.setRequestHeader("X-RUM-Endpoint-Id", rumIds.endpoint_id);
+          } catch (e) {
+            console.warn("Could not set RUM headers", e);
+          }
+        }
+      });
+
       this.addEventListener("loadend", function() {
         const duration = performance.now() - this._reqData.start;
-        sendMetrics({
-          session_id: rumIds.session_id,
-          endpoint_id: rumIds.endpoint_id,
-          url: window.location.href,
-          timestamp: new Date().toISOString(),
-          trigger: "api_call",
+        const data = {
           api: {
             type: "xhr",
             method: this._reqData.method,
@@ -200,64 +240,21 @@
             status: this.status,
             duration
           }
-        });
+        };
+        if (this.status >= 400) {
+          sendError({ trigger: "api_call_error", ...data });
+        } else {
+          sendMetrics({ trigger: "api_call", ...data });
+        }
       });
+
       open.apply(this, arguments);
     };
   })(XMLHttpRequest.prototype.open);
 
-  (function(fetchFn) {
-    window.fetch = function() {
-      const start = performance.now();
-      const input = arguments[0];
-      const init = arguments[1] || {};
-      const method = init.method || "GET";
-      return fetchFn.apply(this, arguments).then(response => {
-        const duration = performance.now() - start;
-        sendMetrics({
-          session_id: rumIds.session_id,
-          endpoint_id: rumIds.endpoint_id,
-          url: window.location.href,
-          timestamp: new Date().toISOString(),
-          trigger: "api_call",
-          api: {
-            type: "fetch",
-            method,
-            endpoint: typeof input === "string" ? input : input.url,
-            status: response.status,
-            duration
-          }
-        });
-        return response;
-      }).catch(err => {
-        const duration = performance.now() - start;
-        sendMetrics({
-          session_id: rumIds.session_id,
-          endpoint_id: rumIds.endpoint_id,
-          url: window.location.href,
-          timestamp: new Date().toISOString(),
-          trigger: "api_call_error",
-          api: {
-            type: "fetch",
-            method,
-            endpoint: typeof input === "string" ? input : input.url,
-            status: null,
-            duration,
-            error: err.message
-          }
-        });
-        throw err;
-      });
-    };
-  })(window.fetch);
-
-  // ---------------- Business Metrics (Custom) ----------------
+  // ---------------- Business Metrics ----------------
   function logBusinessMetric(name, value, extra = {}) {
     sendMetrics({
-      session_id: rumIds.session_id,
-      endpoint_id: rumIds.endpoint_id,
-      url: window.location.href,
-      timestamp: new Date().toISOString(),
       trigger: "business_metric",
       business: { name, value, ...extra }
     });
@@ -279,10 +276,6 @@
   // ---------------- Environment Metrics ----------------
   window.addEventListener("load", () => {
     sendMetrics({
-      session_id: rumIds.session_id,
-      endpoint_id: rumIds.endpoint_id,
-      url: window.location.href,
-      timestamp: new Date().toISOString(),
       trigger: "environment",
       environment: collectEnvironmentMetrics()
     });
@@ -309,19 +302,15 @@
     setTimeout(() => sendMetrics(collectRUMMetrics("spa_navigation")), 300);
   });
 
-  // ---------------- Heartbeat (real-time users) ----------------
+  // ---------------- Heartbeat ----------------
   function sendHeartbeat() {
     sendMetrics({
-      session_id: rumIds.session_id,
-      endpoint_id: rumIds.endpoint_id,
-      url: window.location.href,
-      timestamp: new Date().toISOString(),
       trigger: "heartbeat",
       environment: collectEnvironmentMetrics()
     });
   }
 
-  setInterval(sendHeartbeat, 15000); // every 15s
+  setInterval(sendHeartbeat, 15000);
   window.addEventListener("load", sendHeartbeat);
 
 })();
