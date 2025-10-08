@@ -1,5 +1,5 @@
+// ========== RUM (metrics + errors) — preserved logic ==========
 (function () {
-  // -------- Locate the <script> tag and read config --------
   const currentScript =
     document.currentScript || document.querySelector('script[data-endpoint-id]');
 
@@ -15,7 +15,6 @@
     ? currentScript.getAttribute('data-errors-url') || apiBaseUrl
     : apiBaseUrl;
 
-  // -------- Session ID (persists for this browser tab) --------
   const sessionId =
     sessionStorage.getItem('rum_session_id') ||
     'sess-' + Date.now() + '-' + Math.random().toString(16).slice(2);
@@ -23,15 +22,20 @@
 
   const rumIds = { session_id: sessionId, endpoint_id: endpointId };
 
-  // -------- Helpers --------
-  function toEpochMs(monotonicMs) {
-    return performance.timeOrigin + monotonicMs;
-  }
+  try {
+    window.__rumShared = Object.freeze({
+      sessionId, endpointId, apiBaseUrl
+    });
+  } catch { window.__rumShared = { sessionId, endpointId, apiBaseUrl }; }
+
+  function toEpochMs(monotonicMs) { return performance.timeOrigin + monotonicMs; }
 
   function post(url, payload, useBeacon = false) {
     if (useBeacon && navigator.sendBeacon) {
-      const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
-      return navigator.sendBeacon(url, blob);
+      try {
+        const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+        return navigator.sendBeacon(url, blob);
+      } catch (_) {}
     }
     return fetch(url, {
       method: 'POST',
@@ -43,17 +47,16 @@
 
   function sendMetrics(data) {
     const payload = { ...data, ...rumIds };
-    return post(`${apiBaseUrl}/rum/page-metrics`, payload, true);
+    return post(`${apiBaseUrl.replace(/\/+$/,'')}/rum/page-metrics`, payload, true);
   }
 
   function sendError(data) {
     const payload = { ...data, ...rumIds };
-    return post(`${errorsBaseUrl}/rum/errors`, payload, false);
+    return post(`${errorsBaseUrl.replace(/\/+$/,'')}/rum/errors`, payload, false);
   }
 
-  // -------- Performance Observers --------
+  // ---- Perf observers
   let fpValue = null, fcpValue = null, lcpValue = null;
-
   try {
     const paintObserver = new PerformanceObserver((list) => {
       for (const e of list.getEntries()) {
@@ -63,62 +66,40 @@
     });
     paintObserver.observe({ type: 'paint', buffered: true });
   } catch {}
-
   try {
     const lcpObserver = new PerformanceObserver((list) => {
-      const entries = list.getEntries();
-      const last = entries[entries.length - 1];
+      const entries = list.getEntries(); const last = entries[entries.length - 1];
       if (last) lcpValue = last.startTime;
     });
     lcpObserver.observe({ type: 'largest-contentful-paint', buffered: true });
   } catch {}
 
-  // INP / FID
-  let fidValue = null, inpValue = null;
-
+  // INP/FID/CLS
+  let fidValue = null, inpValue = null, clsValue = 0;
   try {
     const fidObserver = new PerformanceObserver((list) => {
-      for (const entry of list.getEntries()) {
-        if (entry.entryType === 'first-input') {
-          fidValue = entry.processingStart - entry.startTime;
-        }
+      for (const e of list.getEntries()) {
+        if (e.entryType === 'first-input') fidValue = e.processingStart - e.startTime;
       }
-    });
-    fidObserver.observe({ type: 'first-input', buffered: true });
+    }); fidObserver.observe({ type: 'first-input', buffered: true });
   } catch {}
-
   try {
     const inpObserver = new PerformanceObserver((list) => {
-      for (const entry of list.getEntries()) {
-        if (entry.interactionId) inpValue = entry.duration;
-      }
-    });
-    inpObserver.observe({ type: 'event', buffered: true, durationThreshold: 16 });
+      for (const e of list.getEntries()) { if (e.interactionId) inpValue = e.duration; }
+    }); inpObserver.observe({ type: 'event', buffered: true, durationThreshold: 16 });
   } catch {}
-
-  // CLS
-  let clsValue = 0;
   try {
     const clsObserver = new PerformanceObserver((list) => {
-      for (const entry of list.getEntries()) {
-        if (!entry.hadRecentInput) clsValue += entry.value;
-      }
-    });
-    clsObserver.observe({ type: 'layout-shift', buffered: true });
+      for (const e of list.getEntries()) { if (!e.hadRecentInput) clsValue += e.value; }
+    }); clsObserver.observe({ type: 'layout-shift', buffered: true });
   } catch {}
 
   function collectResourceMetrics() {
     const resources = performance.getEntriesByType('resource') || [];
-    return resources
-      .filter((r) => r.initiatorType !== 'beacon')
-      .map((r) => ({
-        name: r.name,
-        type: r.initiatorType,
-        duration: r.duration,
-        transferSize: r.transferSize || null,
-        startTime: r.startTime,
-        responseEnd: r.responseEnd
-      }));
+    return resources.filter(r => r.initiatorType !== 'beacon').map(r => ({
+      name: r.name, type: r.initiatorType, duration: r.duration,
+      transferSize: r.transferSize || null, startTime: r.startTime, responseEnd: r.responseEnd
+    }));
   }
 
   function collectEnvironmentMetrics() {
@@ -132,11 +113,7 @@
       screen_height: window.screen?.height || 0,
       pixel_ratio: window.devicePixelRatio || 1,
       connection: navigator.connection
-        ? {
-            effectiveType: navigator.connection.effectiveType,
-            downlink: navigator.connection.downlink,
-            rtt: navigator.connection.rtt
-          }
+        ? { effectiveType: navigator.connection.effectiveType, downlink: navigator.connection.downlink, rtt: navigator.connection.rtt }
         : 'not_supported'
     };
   }
@@ -162,133 +139,72 @@
     };
   }
 
-  // -------- Session lifecycle (start/end) --------
+  // ---- Session lifecycle
   if (!sessionStorage.getItem('rum_session_start')) {
     sessionStorage.setItem('rum_session_start', String(Date.now()));
-    sendMetrics({
-      trigger: 'session_start',
-      session: {
-        start_ts: new Date().toISOString(),
-        start_epoch_ms: Date.now()
-      }
-    });
+    sendMetrics({ trigger: 'session_start', session: { start_ts: new Date().toISOString(), start_epoch_ms: Date.now() } });
   }
-
-  ['pagehide', 'visibilitychange', 'beforeunload'].forEach((evt) => {
-    window.addEventListener(
-      evt,
-      () => {
-        if (document.visibilityState === 'hidden' || evt !== 'visibilitychange') {
-          sendMetrics({
-            trigger: 'session_end',
-            session: {
-              start_epoch_ms: Number(sessionStorage.getItem('rum_session_start')) || null,
-              end_ts: new Date().toISOString(),
-              end_epoch_ms: Date.now()
-            }
-          });
-        }
-      },
-      { once: true }
-    );
-  });
-
-  // -------- Error capture --------
-  window.addEventListener('error', function (event) {
-    sendError({
-      trigger: 'js_error',
-      error: {
-        message: event.message,
-        source: event.filename,
-        lineno: event.lineno,
-        colno: event.colno,
-        stack: event.error ? event.error.stack : null
+  ['pagehide','visibilitychange','beforeunload'].forEach(evt => {
+    window.addEventListener(evt, () => {
+      if (document.visibilityState === 'hidden' || evt !== 'visibilitychange') {
+        sendMetrics({ trigger: 'session_end', session: {
+          start_epoch_ms: Number(sessionStorage.getItem('rum_session_start')) || null,
+          end_ts: new Date().toISOString(), end_epoch_ms: Date.now()
+        }});
       }
-    });
+    }, { once: true });
   });
 
-  window.addEventListener('unhandledrejection', function (event) {
-    sendError({
-      trigger: 'js_promise_rejection',
-      error: {
-        message: event.reason ? event.reason.message || String(event.reason) : 'Unhandled Promise Rejection',
-        stack: event.reason && event.reason.stack ? event.reason.stack : null
-      }
-    });
+  // ---- Errors
+  window.addEventListener('error', (e) => {
+    sendError({ trigger: 'js_error', error: {
+      message: e.message, source: e.filename, lineno: e.lineno, colno: e.colno, stack: e.error ? e.error.stack : null
+    }});
+  });
+  window.addEventListener('unhandledrejection', (e) => {
+    sendError({ trigger: 'js_promise_rejection', error: {
+      message: e.reason ? e.reason.message || String(e.reason) : 'Unhandled Promise Rejection',
+      stack: e.reason && e.reason.stack ? e.reason.stack : null
+    }});
   });
 
-  // -------- Patch fetch (inject headers + timings + errors) --------
+  // ---- fetch
   (function (fetchFn) {
     window.fetch = function (input, init = {}) {
       init = init || {};
-      init.headers = {
-        ...(init.headers || {}),
-        'X-RUM-Session-Id': rumIds.session_id,
-        'X-RUM-Endpoint-Id': rumIds.endpoint_id
-      };
+      init.headers = { ...(init.headers || {}), 'X-RUM-Session-Id': rumIds.session_id, 'X-RUM-Endpoint-Id': rumIds.endpoint_id };
 
       const startMono = performance.now();
       const startEpoch = toEpochMs(startMono);
       const method = (init.method || 'GET').toUpperCase();
       const endpoint = typeof input === 'string' ? input : input.url;
 
-      return fetchFn.call(this, input, init)
-        .then((response) => {
-          const endMono = performance.now();
-          const endEpoch = toEpochMs(endMono);
-          const duration = endMono - startMono;
-
-          const rec = {
-            api: {
-              type: 'fetch',
-              method,
-              endpoint,
-              status: response.status,
-              duration,
-              start_epoch_ms: startEpoch,
-              end_epoch_ms: endEpoch,
-              start_ts: new Date(startEpoch).toISOString(),
-              end_ts: new Date(endEpoch).toISOString()
-            }
-          };
-
-          if (response.status >= 400) {
-            sendError({ trigger: 'api_call_error', ...rec });
-          } else {
-            sendMetrics({ trigger: 'api_call', ...rec });
-          }
-          return response;
-        })
-        .catch((err) => {
-          const endMono = performance.now();
-          const endEpoch = toEpochMs(endMono);
-          const duration = endMono - startMono;
-
-          sendError({
-            trigger: 'api_call_exception',
-            api: {
-              type: 'fetch',
-              method,
-              endpoint,
-              status: null,
-              duration,
-              error: err?.message || String(err),
-              start_epoch_ms: startEpoch,
-              end_epoch_ms: endEpoch,
-              start_ts: new Date(startEpoch).toISOString(),
-              end_ts: new Date(endEpoch).toISOString()
-            }
-          });
-          throw err;
-        });
+      return fetchFn.call(this, input, init).then((response) => {
+        const endMono = performance.now(); const endEpoch = toEpochMs(endMono); const duration = endMono - startMono;
+        const rec = { api: {
+          type: 'fetch', method, endpoint, status: response.status, duration,
+          start_epoch_ms: startEpoch, end_epoch_ms: endEpoch,
+          start_ts: new Date(startEpoch).toISOString(), end_ts: new Date(endEpoch).toISOString()
+        }};
+        if (response.status >= 400) { sendError({ trigger: 'api_call_error', ...rec }); }
+        else { sendMetrics({ trigger: 'api_call', ...rec }); }
+        return response;
+      }).catch((err) => {
+        const endMono = performance.now(); const endEpoch = toEpochMs(endMono); const duration = endMono - startMono;
+        sendError({ trigger: 'api_call_exception', api: {
+          type: 'fetch', method, endpoint, status: null, duration, error: err?.message || String(err),
+          start_epoch_ms: startEpoch, end_epoch_ms: endEpoch,
+          start_ts: new Date(startEpoch).toISOString(), end_ts: new Date(endEpoch).toISOString()
+        }});
+        throw err;
+      });
     };
   })(window.fetch);
 
-  // -------- Patch XHR (inject headers + timings + errors) --------
+  // ---- XHR
   (function (open) {
     XMLHttpRequest.prototype.open = function (method, url, async, user, password) {
       this._reqData = { method: (method || 'GET').toUpperCase(), url };
-
       this.addEventListener('readystatechange', function () {
         if (this.readyState === 1) {
           try {
@@ -299,69 +215,120 @@
           this._reqData.startEpoch = toEpochMs(this._reqData.startMono);
         }
       });
-
       this.addEventListener('loadend', function () {
-        const endMono = performance.now();
-        const endEpoch = toEpochMs(endMono);
+        const endMono = performance.now(); const endEpoch = toEpochMs(endMono);
         const startEpoch = this._reqData.startEpoch || toEpochMs(this._reqData.startMono || 0);
         const duration = endMono - (this._reqData.startMono || endMono);
-
-        const base = {
-          api: {
-            type: 'xhr',
-            method: this._reqData.method,
-            endpoint: this._reqData.url,
-            status: this.status,
-            duration,
-            start_epoch_ms: startEpoch,
-            end_epoch_ms: endEpoch,
-            start_ts: new Date(startEpoch).toISOString(),
-            end_ts: new Date(endEpoch).toISOString()
-          }
-        };
-
-        if (this.status >= 400) {
-          sendError({ trigger: 'api_call_error', ...base });
-        } else {
-          sendMetrics({ trigger: 'api_call', ...base });
-        }
+        const base = { api: {
+          type: 'xhr', method: this._reqData.method, endpoint: this._reqData.url, status: this.status, duration,
+          start_epoch_ms: startEpoch, end_epoch_ms: endEpoch,
+          start_ts: new Date(startEpoch).toISOString(), end_ts: new Date(endEpoch).toISOString()
+        }};
+        if (this.status >= 400) { sendError({ trigger: 'api_call_error', ...base }); }
+        else { sendMetrics({ trigger: 'api_call', ...base }); }
       });
-
       open.apply(this, arguments);
     };
   })(XMLHttpRequest.prototype.open);
 
-  // -------- Business metric helper (optional public API) --------
+  // ---- Business metric helper
   function logBusinessMetric(name, value, extra = {}) {
-    sendMetrics({
-      trigger: 'business_metric',
-      business: { name, value, ...extra }
-    });
+    sendMetrics({ trigger: 'business_metric', business: { name, value, ...extra } });
   }
   window.__rumLogBusiness = logBusinessMetric;
 
-  // -------- Environment + Page load + SPA routing --------
+  // ---- Environment + page load + SPA
   window.addEventListener('load', () => {
     sendMetrics({ trigger: 'environment', environment: collectEnvironmentMetrics() });
     setTimeout(() => sendMetrics(collectRUMMetrics('page_load')), 1000);
   });
-
-  ['pushState', 'replaceState'].forEach((fn) => {
-    const orig = history[fn];
-    history[fn] = function () {
-      orig.apply(this, arguments);
-      window.dispatchEvent(new Event('spa-navigation'));
-    };
+  ['pushState','replaceState'].forEach((fn) => {
+    const orig = history[fn]; history[fn] = function () { orig.apply(this, arguments); window.dispatchEvent(new Event('spa-navigation')); };
   });
   window.addEventListener('popstate', () => window.dispatchEvent(new Event('spa-navigation')));
-  window.addEventListener('spa-navigation', () => {
-    setTimeout(() => sendMetrics(collectRUMMetrics('spa_navigation')), 300);
-  });
+  window.addEventListener('spa-navigation', () => { setTimeout(() => sendMetrics(collectRUMMetrics('spa_navigation')), 300); });
 
-  // -------- Heartbeat (active users) --------
-  function sendHeartbeat() {
-    sendMetrics({ trigger: 'heartbeat', environment: collectEnvironmentMetrics() });
+  // ---- Heartbeat
+  function sendHeartbeat() { sendMetrics({ trigger: 'heartbeat', environment: collectEnvironmentMetrics() }); }
+  setInterval(sendHeartbeat, 15000); window.addEventListener('load', sendHeartbeat);
+})();
+
+// ========== Session Replay (rrweb) with dedicated replay route ==========
+(function () {
+  const shared = window.__rumShared || {};
+  const sessionId = shared.sessionId ||
+    sessionStorage.getItem('rum_session_id') ||
+    ('sess-' + Date.now() + '-' + Math.random().toString(16).slice(2));
+  const endpointId = shared.endpointId || null;
+
+  // Read replay config off the same <script> tag
+  const tag = document.querySelector('script[data-endpoint-id]');
+  const apiBaseUrl = (shared.apiBaseUrl || 'http://localhost:8000').replace(/\/+$/,'');
+  const replayUrlAttr = tag?.getAttribute('data-replay-url');            // full URL (highest priority)
+  const replayBaseAttr = tag?.getAttribute('data-replay-base-url');      // base URL (append /rum/events)
+  const replayUrl = (replayUrlAttr ||
+                    ((replayBaseAttr || apiBaseUrl).replace(/\/+$/,'') + '/rum/events'));
+
+  const BATCH_SIZE = Math.max(1, Number(tag?.getAttribute('data-replay-batch')) || 25);
+  const FLUSH_MS   = Math.max(1000, Number(tag?.getAttribute('data-replay-flush-ms')) || 5000);
+
+  let events = []; let flushTimer = null;
+
+  function scheduleFlush() { if (!flushTimer) flushTimer = setTimeout(() => flush(false), FLUSH_MS); }
+
+  function flush(useBeacon) {
+    if (!events.length) { clearTimeout(flushTimer); flushTimer = null; return; }
+    const payload = {
+      sessionId: sessionId,
+      endpointId: endpointId,
+      url: location.href,
+      ts: new Date().toISOString(),
+      events: events
+    };
+    if (useBeacon && navigator.sendBeacon) {
+      try {
+        const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+        navigator.sendBeacon(replayUrl, blob);
+      } catch (_) {}
+    } else {
+      fetch(replayUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        keepalive: true
+      }).catch(() => {});
+    }
+    events = []; clearTimeout(flushTimer); flushTimer = null;
   }
-  setInterval(sendHeartbeat, 15000);
-  window.addEventListener('load', sendHeartbeat);
+
+  function startRecording() {
+    if (!window.rrweb || typeof rrweb.record !== 'function') {
+      console.warn('[RUM] rrweb not available.');
+      return;
+    }
+    rrweb.record({
+      emit(evt) {
+        events.push(evt);
+        if (events.length >= BATCH_SIZE) { flush(false); }
+        else { scheduleFlush(); }
+      }
+    });
+  }
+
+  if (!window.rrweb) {
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/rrweb@latest/dist/rrweb.min.js';
+    s.async = true;
+    s.onload = startRecording;
+    s.onerror = () => console.warn('[RUM] Failed to load rrweb');
+    document.head.appendChild(s);
+  } else {
+    startRecording();
+  }
+
+  ['pagehide','visibilitychange','beforeunload'].forEach((evt) => {
+    window.addEventListener(evt, () => {
+      if (document.visibilityState === 'hidden' || evt !== 'visibilitychange') { flush(true); }
+    });
+  });
 })();
