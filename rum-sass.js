@@ -254,81 +254,81 @@
 })();
 
 // ========== Session Replay (rrweb) with dedicated replay route ==========
-// (function () {
-//   const shared = window.__rumShared || {};
-//   const sessionId = shared.sessionId ||
-//     sessionStorage.getItem('rum_session_id') ||
-//     ('sess-' + Date.now() + '-' + Math.random().toString(16).slice(2));
-//   const endpointId = shared.endpointId || null;
+(function () {
+  const shared = window.__rumShared || {};
+  const sessionId = shared.sessionId ||
+    sessionStorage.getItem('rum_session_id') ||
+    ('sess-' + Date.now() + '-' + Math.random().toString(16).slice(2));
+  const endpointId = shared.endpointId || null;
 
-//   // Read replay config off the same <script> tag
-//   const tag = document.querySelector('script[data-endpoint-id]');
-//   const apiBaseUrl = (shared.apiBaseUrl || 'http://localhost:8000').replace(/\/+$/,'');
-//   const replayUrlAttr = tag?.getAttribute('data-replay-url');            // full URL (highest priority)
-//   const replayBaseAttr = tag?.getAttribute('data-replay-base-url');      // base URL (append /rum/events)
-//   const replayUrl = (replayUrlAttr ||
-//                     ((replayBaseAttr || apiBaseUrl).replace(/\/+$/,'') + '/rum/events'));
+  // Read replay config off the same <script> tag
+  const tag = document.querySelector('script[data-endpoint-id]');
+  const apiBaseUrl = (shared.apiBaseUrl || 'http://localhost:8000').replace(/\/+$/,'');
+  const replayUrlAttr = tag?.getAttribute('data-replay-url');            // full URL (highest priority)
+  const replayBaseAttr = tag?.getAttribute('data-replay-base-url');      // base URL (append /rum/events)
+  const replayUrl = (replayUrlAttr ||
+                    ((replayBaseAttr || apiBaseUrl).replace(/\/+$/,'') + '/rum/events'));
 
-//   const BATCH_SIZE = Math.max(1, Number(tag?.getAttribute('data-replay-batch')) || 25);
-//   const FLUSH_MS   = Math.max(1000, Number(tag?.getAttribute('data-replay-flush-ms')) || 5000);
+  const BATCH_SIZE = Math.max(1, Number(tag?.getAttribute('data-replay-batch')) || 25);
+  const FLUSH_MS   = Math.max(1000, Number(tag?.getAttribute('data-replay-flush-ms')) || 5000);
 
-//   let events = []; let flushTimer = null;
+  let events = []; let flushTimer = null;
 
-//   function scheduleFlush() { if (!flushTimer) flushTimer = setTimeout(() => flush(false), FLUSH_MS); }
+  function scheduleFlush() { if (!flushTimer) flushTimer = setTimeout(() => flush(false), FLUSH_MS); }
 
-//   function flush(useBeacon) {
-//     if (!events.length) { clearTimeout(flushTimer); flushTimer = null; return; }
-//     const payload = {
-//       sessionId: sessionId,
-//       endpointId: endpointId,
-//       url: location.href,
-//       ts: new Date().toISOString(),
-//       events: events
-//     };
-//     if (useBeacon && navigator.sendBeacon) {
-//       try {
-//         const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
-//         navigator.sendBeacon(replayUrl, blob);
-//       } catch (_) {}
-//     } else {
-//       fetch(replayUrl, {
-//         method: 'POST',
-//         headers: { 'Content-Type': 'application/json' },
-//         body: JSON.stringify(payload),
-//         keepalive: true
-//       }).catch(() => {});
-//     }
-//     events = []; clearTimeout(flushTimer); flushTimer = null;
-//   }
+  function flush(useBeacon) {
+    if (!events.length) { clearTimeout(flushTimer); flushTimer = null; return; }
+    const payload = {
+      sessionId: sessionId,
+      endpointId: endpointId,
+      url: location.href,
+      ts: new Date().toISOString(),
+      events: events
+    };
+    if (useBeacon && navigator.sendBeacon) {
+      try {
+        const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+        navigator.sendBeacon(replayUrl, blob);
+      } catch (_) {}
+    } else {
+      fetch(replayUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        keepalive: true
+      }).catch(() => {});
+    }
+    events = []; clearTimeout(flushTimer); flushTimer = null;
+  }
 
-//   function startRecording() {
-//     if (!window.rrweb || typeof rrweb.record !== 'function') {
-//       console.warn('[RUM] rrweb not available.');
-//       return;
-//     }
-//     rrweb.record({
-//       emit(evt) {
-//         events.push(evt);
-//         if (events.length >= BATCH_SIZE) { flush(false); }
-//         else { scheduleFlush(); }
-//       }
-//     });
-//   }
+  function startRecording() {
+    if (!window.rrweb || typeof rrweb.record !== 'function') {
+      console.warn('[RUM] rrweb not available.');
+      return;
+    }
+    rrweb.record({
+      emit(evt) {
+        events.push(evt);
+        if (events.length >= BATCH_SIZE) { flush(false); }
+        else { scheduleFlush(); }
+      }
+    });
+  }
 
-//   if (!window.rrweb) {
-//     const s = document.createElement('script');
-//     s.src = 'https://cdn.jsdelivr.net/npm/rrweb@latest/dist/rrweb.min.js';
-//     s.async = true;
-//     s.onload = startRecording;
-//     s.onerror = () => console.warn('[RUM] Failed to load rrweb');
-//     document.head.appendChild(s);
-//   } else {
-//     startRecording();
-//   }
+  if (!window.rrweb) {
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/rrweb@latest/dist/rrweb.min.js';
+    s.async = true;
+    s.onload = startRecording;
+    s.onerror = () => console.warn('[RUM] Failed to load rrweb');
+    document.head.appendChild(s);
+  } else {
+    startRecording();
+  }
 
-//   ['pagehide','visibilitychange','beforeunload'].forEach((evt) => {
-//     window.addEventListener(evt, () => {
-//       if (document.visibilityState === 'hidden' || evt !== 'visibilitychange') { flush(true); }
-//     });
-//   });
-// })();
+  ['pagehide','visibilitychange','beforeunload'].forEach((evt) => {
+    window.addEventListener(evt, () => {
+      if (document.visibilityState === 'hidden' || evt !== 'visibilitychange') { flush(true); }
+    });
+  });
+})();
